@@ -26,6 +26,44 @@ class SyncResult
     }
 }
 
+abstract class ChallengeAdapter
+{
+    abstract public function get();
+    abstract public function set($challengeData);
+}
+
+class DefaultChallengeAdapter extends ChallengeAdapter
+{
+    const FILENAME = 'nextChallenge.dat';
+
+    protected $filename;
+    public function setFilename($filename)
+    {
+        $this->filename = $filename;
+    }
+
+    public function getFilename() {
+        return $this->filename;
+    }
+
+    public function get()
+    {
+        if(is_readable($this->challengeFilename)) {
+            $challengeData = file_get_contents($this->filename);
+            if($challengeData)
+                $this->challengeData = $challengeData;
+        }
+    }
+
+    public function set($challengeData) {
+        file_put_contents($this->filename, $challengeData);
+    }
+
+    public function __construct() {
+        $this->filename = self::FILENAME;
+    }
+}
+
 class WhatsProt
 {
     /**
@@ -54,7 +92,6 @@ class WhatsProt
      * Property declarations.
      */
     protected $accountInfo;             // The AccountInfo object.
-    protected $challengeFilename = 'nextChallenge.dat';
     protected $challengeData;           //
     protected $debug;                   // Determines whether debug mode is on or off.
     protected $event;                   // An instance of the WhatsApiEvent Manager.
@@ -78,6 +115,8 @@ class WhatsProt
     protected $serverReceivedId;        // Confirm that the *server* has received your command.
     protected $socket;                  // A socket to connect to the WhatsApp network.
     protected $writer;                  // An instance of the BinaryTreeNodeWriter class.
+    protected $challengeAdapter;        // Holds logic to read and write nextChallenge.dat from a remote location.
+    protected $memcache;                // Whether or not to use Memcache to store tokens and user agents.
 
     /**
      * Default class constructor.
@@ -108,15 +147,42 @@ class WhatsProt
         $this->name = $nickname;
         $this->loginStatus = static::DISCONNECTED_STATUS;
         $this->eventManager = new WhatsApiEventsManager();
+        $this->challengeAdapter = new DefaultChallengeAdapter();
+        $this->memcache = null;
     }
 
+    public function setChallengeAdapter($challengeAdapter)
+    {
+        $this->challengeAdapter = $challengeAdapter;
+    }
+
+    public function setMemcache($memcache_instance) {
+        $this->memcache = $memcache_instance;
+    }
+
+
+    public function memcacheGet($key, $default_value = null) {
+        if ($this->memcache) {
+            $res = $this->memcache->get($key);
+            if ($res == false && $this->memcache->getResultCode() == Memcached::RES_NOTFOUND) {
+                return $default_value;
+            }
+
+            return $res;
+        }
+
+        return $default_value;
+    }
     /**
      * If you need use diferent challenge fileName you can use this
      *
      * @param string $filename
      */
     public function setChallengeName($filename){
-        $this->challengeFilename = $filename;
+        if (is_a($this->challengeAdapter, 'DefaultChallengeAdapter'))
+        {
+            $this->challengeAdapter->setFilename($filename);
+        }
     }
 
     /**
@@ -358,7 +424,7 @@ class WhatsProt
           $mnc = $phone['mnc'];
 
         // Build the token.
-        $token = generateRequestToken($phone['country'], $phone['phone']);
+        $token = generateRequestToken($phone['country'], $phone['phone'], $this->memcache);
 
         // Build the url.
         $host = 'https://' . static::WHATSAPP_REQUEST_HOST;
@@ -466,14 +532,16 @@ class WhatsProt
         $WAver = trim(file_get_contents(static::WHATSAPP_VER_CHECKER));
 
         $WAverS = str_replace(".","",$WAver);
-        $ver = str_replace(".","",static::WHATSAPP_VER);
 
+        $curr_ver = $this->memcacheGet('whatsapp_ver', static::WHATSAPP_VER);
+
+        $ver = str_replace(".","",$curr_ver);
         if($ver<$WAverS)
         {
           $classesMD5 = file_get_contents('https://coderus.openrepos.net/whitesoft/whatsapp_classes');
 
-          updateData('token.php', $WAver, $classesMD5);
-          updateData('whatsprot.class.php', $WAver);
+          updateData('token.php', $WAver, $classesMD5, $this->memcache);
+          updateData('whatsprot.class.php', $WAver, null, $this->memcache);
         }
 
         /* Create a TCP/IP socket. */
@@ -595,10 +663,9 @@ class WhatsProt
     public function loginWithPassword($password)
     {
         $this->password = $password;
-        if(is_readable($this->challengeFilename)) {
-            $challengeData = file_get_contents($this->challengeFilename);
-            if($challengeData)
-                $this->challengeData = $challengeData;
+        $challengeData = $this->challengeAdapter->get();
+        if ($challengeData) {
+            $this->challengeData = $challengeData;
         }
         $this->doLogin();
     }
@@ -2045,7 +2112,8 @@ class WhatsProt
             $this->reader->setKey($this->inputKey);
             //$this->writer->setKey($this->outputKey);
             $phone = $this->dissectPhone();
-            $array = "\0\0\0\0" . $this->phoneNumber . $this->challengeData . time() . static::WHATSAPP_USER_AGENT . " MccMnc/" . str_pad($phone["mcc"], 3, "0", STR_PAD_LEFT) . $phone["mnc"];
+            $ua = $this->memcacheGet('whatsapp_user_agent', static::WHATSAPP_USER_AGENT);
+            $array = "\0\0\0\0" . $this->phoneNumber . $this->challengeData . time() . $ua . " MccMnc/" . str_pad($phone["mcc"], 3, "0", STR_PAD_LEFT) . $phone["mnc"];
             $this->challengeData = null;
             return $this->outputKey->EncodeMessage($array, 0, strlen($array), false);
         }
@@ -2217,7 +2285,8 @@ class WhatsProt
 
         $this->writer->resetKey();
         $this->reader->resetKey();
-        $resource = static::WHATSAPP_DEVICE . '-' . static::WHATSAPP_VER . '-' . static::PORT;
+        $wa_ver = $this->memcacheGet('whatsapp_ver', static::WHATSAPP_VER);
+        $resource = sprintf('%s-%s-%s', static::WHATSAPP_DEVICE, $wa_ver, static::PORT);
         $data = $this->writer->StartStream(static::WHATSAPP_SERVER, $resource);
         $feat = $this->createFeaturesNode();
         $auth = $this->createAuthNode();
@@ -2457,11 +2526,12 @@ class WhatsProt
         // Open connection.
         $ch = curl_init();
 
+        $ua = $this->memcacheGet('whatsapp_user_agent', static::WHATSAPP_USER_AGENT);
         // Configure the connection.
         curl_setopt($ch, CURLOPT_URL, $url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_HEADER, 0);
-        curl_setopt($ch, CURLOPT_USERAGENT, static::WHATSAPP_USER_AGENT);
+        curl_setopt($ch, CURLOPT_USERAGENT, $ua);
         curl_setopt($ch, CURLOPT_HTTPHEADER, array('Accept: text/json'));
         // This makes CURL accept any peer!
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
@@ -2526,7 +2596,7 @@ class WhatsProt
         elseif ($node->getTag() == "success") {
             $this->loginStatus = static::CONNECTED_STATUS;
             $challengeData = $node->getData();
-            file_put_contents($this->challengeFilename, $challengeData);
+            $this->challengeAdapter->set($challengeData);
             $this->writer->setKey($this->outputKey);
         } elseif($node->getTag() == "failure")
         {
